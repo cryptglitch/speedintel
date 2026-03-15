@@ -448,34 +448,140 @@ function setGrade(id,g){
 
 // ── NETWORK INFO ──
 async function fetchNetworkInfo(){
-  const[ipR,cfR]=await Promise.allSettled([fetchIPAPI(),fetchCFTrace()]);
-  const ip=ipR.value||{},cf=cfR.value||{};
-  const addr=ip.ip||cf.ip||'—';
-  set('netIP',addr);set('netProto',addr.includes(':')?' IPv6':'IPv4');
-  const raw=ip.org||'',m=raw.match(/^(AS\d+)\s+(.*)/);
-  const asn=ip.asn||(m?m[1]:'—'),isp=m?m[2]:raw.replace(/^AS\d+\s*/,'')||'—';
-  set('netISP',isp);set('netASN',asn);set('netOrg',ip.org_name||ip.company||isp);
-  set('netLoc',ip.city||'—');
-  set('netRegion',ip.region?(ip.region+(ip.country_code?', '+ip.country_code:'')):'—');
-  set('netCountry',ip.country_name||'—');
-  set('netTZ',ip.timezone||cf.timezone||Intl.DateTimeFormat().resolvedOptions().timeZone||'—');
+  // Show loading state immediately
+  ['netIP','netISP','netASN','netOrg','netLoc','netRegion','netCountry','netTZ','netCF','netServer'].forEach(id=>set(id,'…'));
+
+  // Connection type from Navigator API (synchronous, always works)
   const nc=navigator.connection||navigator.mozConnection||navigator.webkitConnection;
   const map={wifi:'Wi-Fi',ethernet:'Ethernet',cellular:'Cellular',wimax:'WiMAX',bluetooth:'Bluetooth',other:'Other',none:'Offline'};
-  set('netConn',nc?(map[nc.type]||nc.type||'Unknown')+(nc.effectiveType?' ('+nc.effectiveType.toUpperCase()+')':''):'Unknown');
-  const colo=cf.colo||'—';
-  set('netCF',colo+(cf.loc?' ('+cf.loc+')':''));
-  set('netServer','speed.cloudflare.com → '+colo);
-}
-function set(id,v){document.getElementById(id).textContent=v;}
+  set('netConn', nc ? (map[nc.type]||nc.type||'Unknown')+(nc.effectiveType?' ('+nc.effectiveType.toUpperCase()+')':'') : 'Unknown');
+  set('netProto', '…');
 
-async function fetchIPAPI(){
-  try{let r=await fetch('https://ipapi.co/json/',{cache:'no-store'});if(r.ok){const d=await r.json();if(d.ip&&!d.error)return d;}}catch{}
-  try{const r=await fetch('http://ip-api.com/json/?fields=status,country,countryCode,region,regionName,city,timezone,isp,org,as,query',{cache:'no-store'});const d=await r.json();if(d.status==='success')return{ip:d.query,org:d.as+' '+d.isp,org_name:d.org,asn:d.as?.split(' ')[0],city:d.city,region:d.regionName,country_code:d.countryCode,country_name:d.country,timezone:d.timezone};}catch{}
-  try{const r=await fetch('https://ipwho.is/',{cache:'no-store'});const d=await r.json();if(d.success)return{ip:d.ip,org:(d.connection?.asn?'AS'+d.connection.asn:'')+' '+(d.connection?.isp||''),org_name:d.connection?.org,asn:d.connection?.asn?'AS'+d.connection.asn:'—',city:d.city,region:d.region,country_code:d.country_code,country_name:d.country,timezone:d.timezone?.id};}catch{}
-  return{};
+  // Run IP lookup and CF trace in parallel
+  const [ipR, cfR] = await Promise.allSettled([fetchIPAPI(), fetchCFTrace()]);
+  const ip = ipR.value || {}, cf = cfR.value || {};
+
+  // ── IP & Protocol ──
+  const addr = ip.ip || cf.ip || '—';
+  set('netIP', addr);
+  set('netProto', addr.includes(':') ? 'IPv6' : addr.match(/^\d/)  ? 'IPv4' : '—');
+
+  // ── ISP / ASN / Org ──
+  // org field from ipapi.co looks like "AS24560 Bharti Airtel Ltd."
+  const raw = ip.org || '';
+  const m   = raw.match(/^(AS\d+)\s+(.*)/);
+  const asn = ip.asn || (m ? m[1] : null) || '—';
+  const isp = m ? m[2] : (raw.replace(/^AS\d+\s*/,'').trim() || ip.org_name || '—');
+  const org = ip.org_name || (m ? m[2] : raw) || isp;
+
+  set('netISP', isp);
+  set('netASN', asn);
+  set('netOrg', org !== isp ? org : isp); // avoid repeating same value
+
+  // ── Geo ──
+  set('netLoc',     ip.city     || '—');
+  set('netRegion',  ip.region   ? ip.region + (ip.country_code ? ', ' + ip.country_code : '') : '—');
+  set('netCountry', ip.country_name || '—');
+  set('netTZ',      ip.timezone || cf.timezone || Intl.DateTimeFormat().resolvedOptions().timeZone || '—');
+
+  // ── Cloudflare datacenter (from CF trace) ──
+  const colo = cf.colo || '—';
+  set('netCF',     colo + (cf.loc ? ' (' + cf.loc + ')' : ''));
+  set('netServer', 'speed.cloudflare.com → ' + colo);
+
+  // ── IP fallback from CF if all IP APIs failed ──
+  if (addr === '—' && cf.ip) {
+    set('netIP', cf.ip);
+    set('netProto', cf.ip.includes(':') ? 'IPv6' : 'IPv4');
+  }
 }
+function set(id,v){const el=document.getElementById(id);if(el)el.textContent=v;}
+
+// ── ALL sources are HTTPS — critical for GitHub Pages (HTTPS blocks HTTP fetches)
+// ── Run all 5 in parallel, merge best result so no single failure breaks anything
+async function fetchIPAPI(){
+  // Run all HTTPS sources simultaneously, take first successful
+  const sources = [
+    // 1. ipapi.co — rich data, 1000/day free
+    fetch('https://ipapi.co/json/',{cache:'no-store'})
+      .then(r=>r.json())
+      .then(d=>{
+        if(!d.ip||d.error)throw 0;
+        return{ip:d.ip,org:(d.org||''),org_name:d.org_name||d.company,
+          asn:d.asn||(d.org?.match(/^(AS\d+)/)?.[1]),
+          city:d.city,region:d.region,country_code:d.country_code,
+          country_name:d.country_name,timezone:d.timezone};
+      }),
+    // 2. ipwho.is — HTTPS, no stated limit, good fallback
+    fetch('https://ipwho.is/',{cache:'no-store'})
+      .then(r=>r.json())
+      .then(d=>{
+        if(!d.success)throw 0;
+        const asn=d.connection?.asn?'AS'+d.connection.asn:null;
+        const isp=d.connection?.isp||'';
+        return{ip:d.ip,org:(asn?asn+' ':'')+isp,org_name:d.connection?.org,
+          asn,city:d.city,region:d.region,country_code:d.country_code,
+          country_name:d.country,timezone:d.timezone?.id};
+      }),
+    // 3. freeipapi.com — HTTPS, generous free tier
+    fetch('https://freeipapi.com/api/json',{cache:'no-store'})
+      .then(r=>r.json())
+      .then(d=>{
+        if(!d.ipAddress)throw 0;
+        return{ip:d.ipAddress,org:'',org_name:d.isp||'',asn:null,
+          city:d.cityName,region:d.regionName,country_code:d.countryCode,
+          country_name:d.countryName,timezone:d.timeZone};
+      }),
+    // 4. ip.guide — simple HTTPS JSON endpoint
+    fetch('https://ip.guide/',{cache:'no-store',headers:{Accept:'application/json'}})
+      .then(r=>r.json())
+      .then(d=>{
+        if(!d.ip)throw 0;
+        const n=d.network||{},r=d.location||{};
+        const asn=n.autonomous_system?.asn?'AS'+n.autonomous_system.asn:null;
+        const org=n.autonomous_system?.name||'';
+        return{ip:d.ip,org:(asn?asn+' ':'')+org,org_name:org,asn,
+          city:r.city,region:r.region,country_code:r.country,
+          country_name:r.country,timezone:r.timezone};
+      }),
+    // 5. Cloudflare Workers IP endpoint (always works, minimal data)
+    fetch('https://cloudflare.com/cdn-cgi/trace',{cache:'no-store'})
+      .then(r=>r.text())
+      .then(t=>{
+        const kv=Object.fromEntries(t.trim().split('\n').map(l=>l.split('=')));
+        if(!kv.ip)throw 0;
+        return{ip:kv.ip,org:'',org_name:'',asn:null,
+          city:'',region:'',country_code:kv.loc||'',
+          country_name:'',timezone:kv.timezone||''};
+      }),
+  ].map(p=>p.catch(()=>null));
+
+  // Wait for ALL, then pick the richest result (most non-empty fields)
+  const results = await Promise.all(sources);
+  const scored = results
+    .filter(Boolean)
+    .map(d=>({d,score:[d.ip,d.org,d.city,d.region,d.country_name,d.timezone,d.asn].filter(Boolean).length}))
+    .sort((a,b)=>b.score-a.score);
+
+  if(!scored.length)return{};
+
+  // Merge: take best result as base, fill in any blanks from lower results
+  const base={...scored[0].d};
+  for(const{d} of scored.slice(1)){
+    for(const k of Object.keys(d)){
+      if(!base[k]&&d[k])base[k]=d[k];
+    }
+  }
+  return base;
+}
+
 async function fetchCFTrace(){
-  try{const r=await fetch('https://cloudflare.com/cdn-cgi/trace',{cache:'no-store'});return Object.fromEntries((await r.text()).trim().split('\n').map(l=>l.split('=')));}catch{return{};}
+  try{
+    const r=await fetch('https://cloudflare.com/cdn-cgi/trace',{cache:'no-store'});
+    const kv=Object.fromEntries((await r.text()).trim().split('\n').map(l=>l.split('=')));
+    // Also try speed.cloudflare.com trace for more detail
+    return kv;
+  }catch{return{};}
 }
 fetchNetworkInfo();
 
