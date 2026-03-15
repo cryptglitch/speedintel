@@ -586,113 +586,232 @@ async function fetchCFTrace(){
 fetchNetworkInfo();
 
 // ── MEASUREMENT ENGINE ──
+// Philosophy: match how Ookla/fast.com work as closely as possible
+//   • Ping  — use nearest CF PoP (already routing to CCU for you), but
+//             measure only the ESTABLISHED-connection RTT (no DNS/TLS cost)
+//             by reusing the same HTTP/2 connection across pings.
+//   • DL    — skip first 2s of samples (TCP slow-start ramp), use only
+//             steady-state throughput. Final = bytes_total / time_steady.
+//   • UL    — single large XHR per connection is most accurate for upload.
+//             Parallel connections cause head-of-line blocking on 4G/Wi-Fi.
+//             We use 2 parallel streams (not 4) and measure wall-clock bytes.
+
 const CF_BASE='https://speed.cloudflare.com';
 const DL_URLS=[
-  {url:`${CF_BASE}/__down?bytes=10000000`},
-  {url:`${CF_BASE}/__down?bytes=25000000`},
-  {url:`${CF_BASE}/__down?bytes=100000000`},
+  {url:`${CF_BASE}/__down?bytes=10000000`},   // 10 MB
+  {url:`${CF_BASE}/__down?bytes=25000000`},   // 25 MB  — used if >30 Mbps
+  {url:`${CF_BASE}/__down?bytes=100000000`},  // 100 MB — used if >80 Mbps
 ];
 const UL_TARGETS=['https://httpbin.org/post','https://postman-echo.com/post'];
 
-async function measureOnePing(to=4000){
-  const url=`${CF_BASE}/__down?bytes=0&_=${Date.now()}-${Math.random()}`;
-  const ctrl=new AbortController(),t=setTimeout(()=>ctrl.abort(),to),t0=performance.now();
+// ─── PING ───────────────────────────────────────────────────────────────────
+// Key insight: reuse the SAME TCP/HTTP2 connection for all pings.
+// We prime the connection with one fetch, then all subsequent fetches
+// reuse the established session — latency = true server RTT, not setup cost.
+// responseStart - requestStart from PerformanceResourceTiming is the most
+// accurate in-browser measurement (used by Cloudflare's own speed.cf).
+
+async function measureOnePing(to=3000){
+  const url=`${CF_BASE}/__down?bytes=0&nc=${Date.now()}.${Math.random().toString(36).slice(2)}`;
+  const ctrl=new AbortController(),t=setTimeout(()=>ctrl.abort(),to);
   try{
     performance.clearResourceTimings();
-    const res=await fetch(url,{cache:'no-store',mode:'cors',signal:ctrl.signal});
-    await res.arrayBuffer();clearTimeout(t);
-    const e=performance.getEntriesByType('resource').find(e=>e.name.includes('__down'));
-    if(e&&e.responseStart>0&&e.connectEnd>0){const rtt=Math.round(e.responseStart-e.requestStart);if(rtt>0&&rtt<3000)return rtt;}
-    return Math.round(performance.now()-t0);
+    const res=await fetch(url,{cache:'no-store',mode:'cors',signal:ctrl.signal,keepalive:true});
+    await res.arrayBuffer();
+    clearTimeout(t);
+    const entries=performance.getEntriesByType('resource');
+    const e=entries.slice().reverse().find(x=>x.name.includes('__down'));
+    if(e&&e.responseStart>0&&e.requestStart>0){
+      // connectEnd===0 means connection was reused (HTTP/2 multiplexing) — ideal
+      const rtt=Math.round(e.responseStart-e.requestStart);
+      if(rtt>=0&&rtt<2000)return rtt;
+    }
+    return null; // discard unreliable wall-clock fallback — prefer skip over bad data
   }catch{clearTimeout(t);return null;}
 }
 
-async function runPingBattery(rounds=16,cb){
+async function runPingBattery(rounds=20,cb){
   const res=[];let lost=0;
-  await measureOnePing();
-  for(let i=0;i<rounds;i++){const ms=await measureOnePing();ms===null?lost++:res.push(ms);cb(res,lost);await sleep(100);}
+  // Two warmup pings to establish HTTP/2 connection — NOT counted
+  await measureOnePing(5000);
+  await measureOnePing(5000);
+  for(let i=0;i<rounds;i++){
+    const ms=await measureOnePing();
+    if(ms===null){lost++;}else{res.push(ms);}
+    cb(res,lost);
+    await sleep(80); // ~80ms gap between pings (matches Ookla's interval)
+  }
   const pl=parseFloat(((lost/rounds)*100).toFixed(1));
-  const ap=res.length?Math.round(avg(res)):999;
-  const jitter=res.length>1?Math.round(res.reduce((s,v)=>s+Math.abs(v-ap),0)/res.length):0;
+  // Remove outliers: drop top 10% spikes before averaging
+  const sorted=[...res].sort((a,b)=>a-b);
+  const trimmed=sorted.slice(0,Math.max(1,Math.floor(sorted.length*0.9)));
+  const ap=trimmed.length?Math.round(avg(trimmed)):999;
+  // Jitter = mean deviation of consecutive differences (RFC 3550)
+  const jitter=res.length>2
+    ?Math.round(res.slice(1).reduce((s,v,i)=>s+Math.abs(v-res[i]),0)/(res.length-1))
+    :0;
   return{pings:res,avg:ap,jitter,packetLoss:pl};
 }
 
+// ─── TTFB ───────────────────────────────────────────────────────────────────
 async function measureTTFB(){
   const url=`${CF_BASE}/__down?bytes=1&ttfb=1&_=${Date.now()}`;
   try{
     performance.clearResourceTimings();
     await(await fetch(url,{cache:'no-store',mode:'cors'})).arrayBuffer();
-    const e=performance.getEntriesByType('resource').find(e=>e.name.includes('ttfb=1'));
+    const e=performance.getEntriesByType('resource').find(x=>x.name.includes('ttfb=1'));
     if(e&&e.responseStart>0)return Math.round(e.responseStart-e.startTime);
     return null;
   }catch{return null;}
 }
 
+// ─── DOWNLOAD ───────────────────────────────────────────────────────────────
+// Fix for inflated results: skip the first RAMP_MS of samples entirely.
+// TCP slow-start means the first ~1.5s of a transfer ramps up from near-0
+// to full speed — including those samples skews the average UP because the
+// denominator (time) includes dead time but we calculate instantaneous Mbps.
+// Ookla solves this by only measuring the "steady state" window.
 async function measureDownload(cb,signal){
-  const samples=[];let best=0;
-  for(let a=0;a<DL_URLS.length;a++){
-    const{url}=DL_URLS[a],t0=performance.now();let loaded=0,lT=t0,lL=0;
+  const RAMP_MS=2000; // ignore first 2s of each transfer
+  const steadySamples=[];
+  let best=0;
+
+  for(let attempt=0;attempt<DL_URLS.length;attempt++){
+    const{url}=DL_URLS[attempt];
+    const tStart=performance.now();
+    let loaded=0,lastT=tStart,lastL=0;
+    let inSteadyState=false;
+    let steadyStart=tStart,steadyBytes=0;
+
     try{
       const res=await fetch(url+`&r=${Date.now()}`,{cache:'no-store',signal});
       if(!res.ok||!res.body)throw 0;
       const reader=res.body.getReader();
       while(true){
-        const{done,value}=await reader.read();if(done)break;if(signal?.aborted){reader.cancel();break;}
-        loaded+=value.byteLength;const now=performance.now(),el=(now-lT)/1000;
-        if(el>=0.2){const mb=parseFloat((((loaded-lL)*8)/(el*1e6)).toFixed(2));if(mb>0){samples.push(mb);cb(mb);}lT=now;lL=loaded;}
+        const{done,value}=await reader.read();
+        if(done)break;
+        if(signal?.aborted){reader.cancel();break;}
+        loaded+=value.byteLength;
+        const now=performance.now();
+        const sinceStart=now-tStart;
+
+        // Enter steady state after RAMP_MS
+        if(!inSteadyState&&sinceStart>=RAMP_MS){
+          inSteadyState=true;
+          steadyStart=now;
+          steadyBytes=0;
+          lastT=now;lastL=loaded;
+        }
+
+        if(inSteadyState){
+          steadyBytes+=value.byteLength;
+          const el=(now-lastT)/1000;
+          if(el>=0.25){
+            const mb=parseFloat((((loaded-lastL)*8)/(el*1e6)).toFixed(2));
+            if(mb>0){steadySamples.push(mb);cb(mb);}
+            lastT=now;lastL=loaded;
+          }
+        }
       }
-      const fin=parseFloat(((loaded*8)/((performance.now()-t0)/1000*1e6)).toFixed(2));
-      if(fin>best)best=fin;if(fin>50&&a<DL_URLS.length-1)continue;break;
+
+      // Final speed = steady-state bytes / steady-state time (most accurate)
+      if(inSteadyState&&steadyBytes>0){
+        const steadyElapsed=(performance.now()-steadyStart)/1000;
+        const steadyMbps=parseFloat(((steadyBytes*8)/(steadyElapsed*1e6)).toFixed(2));
+        if(steadyMbps>best)best=steadyMbps;
+      }
+
+      // Escalate to larger file if connection is fast
+      const totalMbps=parseFloat(((loaded*8)/((performance.now()-tStart)/1000*1e6)).toFixed(2));
+      if(totalMbps>30&&attempt<DL_URLS.length-1)continue;
+      break;
     }catch(e){if(signal?.aborted)break;break;}
   }
-  return trimmedMean(samples)||best;
+  // Use trimmed mean of steady-state samples, fall back to best overall
+  return trimmedMean(steadySamples)||best;
 }
 
+// ─── UPLOAD ─────────────────────────────────────────────────────────────────
+// Fix for 13 Mbps vs 40 Mbps: the wall-clock ticker was dividing TOTAL bytes
+// by TOTAL elapsed including the ramp-up period — same ramp issue as download.
+// Fix: measure each XHR chunk individually. bytes_sent / time_for_that_chunk.
+// Use only 2 parallel connections (not 4) — more than 2 causes congestion on
+// most mobile connections and actually reduces throughput.
 async function measureUpload(cb,signal){
-  const TEST_MS=12000,RAMP_MS=1000;
-  let total=0,running=true;
-  const t0=performance.now(),snaps=[];
-  const ticker=setInterval(()=>{
-    const el=(performance.now()-t0)/1000;
-    if(el<RAMP_MS/1000||total===0)return;
-    const mb=parseFloat(((total*8)/(el*1e6)).toFixed(2));
-    snaps.push(mb);cb(mb);
-  },300);
-  const stop=setTimeout(()=>{running=false;},TEST_MS);
+  const RAMP_CHUNKS=2;  // skip first 2 chunk measurements per worker (ramp)
+  const TEST_MS=14000;  // 14 second window
+  let running=true;
+  const tStart=performance.now();
+  const chunkSamples=[];  // individual chunk Mbps measurements
+
+  const stopTimer=setTimeout(()=>{running=false;},TEST_MS);
   signal?.addEventListener('abort',()=>{running=false;},{once:true});
 
-  async function streamW(){
-    const CHUNK=65536,buf=new Uint8Array(CHUNK);crypto.getRandomValues(buf);
-    while(running&&!signal?.aborted){
-      try{
-        const stream=new ReadableStream({pull(c){if(!running||signal?.aborted){c.close();return;}total+=CHUNK;c.enqueue(buf.slice(0));}});
-        await fetch(UL_TARGETS[0],{method:'POST',body:stream,signal,duplex:'half',cache:'no-store'}).catch(()=>{});
-      }catch{}
-      await new Promise(r=>setTimeout(r,50));
-    }
-  }
-  async function xhrW(idx){
-    const ep=UL_TARGETS[idx%UL_TARGETS.length],SZ=512*1024;
-    const d=new Uint8Array(SZ);for(let i=0;i<SZ;i+=65536)crypto.getRandomValues(d.subarray(i,Math.min(i+65536,SZ)));
+  // Display ticker using chunk samples
+  const ticker=setInterval(()=>{
+    if(!chunkSamples.length)return;
+    // Show rolling average of last 4 chunks
+    const recent=chunkSamples.slice(-4);
+    const mbps=parseFloat(avg(recent).toFixed(2));
+    if(mbps>0)cb(mbps);
+  },400);
+
+  async function xhrWorker(ep,workerIdx){
+    const SZ=1*1024*1024; // 1 MB per chunk — big enough for accurate timing
+    const d=new Uint8Array(SZ);
+    for(let i=0;i<SZ;i+=65536)crypto.getRandomValues(d.subarray(i,Math.min(i+65536,SZ)));
     const blob=new Blob([d]);
+    let chunkCount=0;
+
     while(running&&!signal?.aborted){
-      await new Promise(res=>{
-        const xhr=new XMLHttpRequest();let last=0;
-        xhr.upload.addEventListener('progress',e=>{if(!e.lengthComputable)return;total+=(e.loaded-last);last=e.loaded;});
-        const done=()=>{total+=(SZ-last);res();};
-        xhr.onload=done;xhr.onerror=done;xhr.ontimeout=done;xhr.timeout=10000;
-        xhr.open('POST',ep,true);xhr.send(blob);
-        const ab=()=>{xhr.abort();res();};
+      const chunkStart=performance.now();
+      let bytesSentThisChunk=0;
+
+      await new Promise(resolve=>{
+        const xhr=new XMLHttpRequest();
+        let lastSent=0;
+        xhr.upload.addEventListener('progress',e=>{
+          if(!e.lengthComputable)return;
+          bytesSentThisChunk+=(e.loaded-lastSent);
+          lastSent=e.loaded;
+        });
+        xhr.onload=()=>{
+          bytesSentThisChunk+=(SZ-lastSent); // credit remaining bytes
+          resolve();
+        };
+        xhr.onerror=()=>resolve();
+        xhr.ontimeout=()=>resolve();
+        xhr.timeout=12000;
+        xhr.open('POST',ep,true);
+        xhr.send(blob);
+        const ab=()=>{xhr.abort();resolve();};
         signal?.addEventListener('abort',ab,{once:true});
         xhr.onloadend=()=>signal?.removeEventListener('abort',ab);
       });
+
+      chunkCount++;
+      // Skip first RAMP_CHUNKS chunks (TCP slow-start)
+      if(chunkCount>RAMP_CHUNKS&&bytesSentThisChunk>0){
+        const elapsed=(performance.now()-chunkStart)/1000;
+        if(elapsed>0.2){
+          const mbps=parseFloat(((bytesSentThisChunk*8)/(elapsed*1e6)).toFixed(2));
+          if(mbps>0)chunkSamples.push(mbps);
+        }
+      }
     }
   }
-  await Promise.all([streamW(),xhrW(0),xhrW(1),xhrW(0)]);
-  clearInterval(ticker);clearTimeout(stop);
-  const cut=Math.floor(snaps.length*0.3),stable=snaps.slice(cut);
-  const fin=parseFloat(((total*8)/((performance.now()-t0)/1000*1e6)).toFixed(2));
-  return trimmedMean(stable.length?stable:snaps)||fin||0;
+
+  // 2 parallel workers on best endpoints
+  await Promise.all([
+    xhrWorker(UL_TARGETS[0],0),
+    xhrWorker(UL_TARGETS[1],1),
+  ]);
+
+  clearInterval(ticker);
+  clearTimeout(stopTimer);
+
+  // Return trimmed mean of all steady-state chunk measurements
+  return trimmedMean(chunkSamples)||0;
 }
 
 function avg(a){return a.length?a.reduce((x,y)=>x+y,0)/a.length:0;}
